@@ -1,0 +1,141 @@
+#!/bin/bash
+
+# TODO: should we set this?
+# set -euo pipefail
+
+# ?= means "set if not already set"
+# TODO: auto quoting? pretty sure quotes in make are copied verbatim at declaration, which is kind of different than bash
+ASSETFS_PATH=${ASSETFS_PATH:-internal/server/gen/bindata_ui.go}
+
+GIT_COMMIT=$(git rev-parse --short HEAD)
+GIT_DIRTY=$(test -n "`git status --porcelain`" && echo "+CHANGES" || true)
+GIT_DESCRIBE=$(git describe --tags --always --match "v*")
+GIT_IMPORT="github.com/hashicorp/waypoint/internal/version"
+GOLDFLAGS="-s -w -X ${GIT_IMPORT}.GitCommit=${GIT_COMMIT}${GIT_DIRTY} -X ${GIT_IMPORT}.GitDescribe=${GIT_DESCRIBE}"
+CGO_ENABLED=${CGO_ENABLED:-0}
+GO_CMD=${GO_CMD:-go}
+
+# bin creates the binaries for Waypoint for the current platform
+bin() (
+  # shmake: every line is a subshell in make :(
+  ( CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ./internal/assets/ceb/ceb ./cmd/waypoint-entrypoint )
+  ( cd internal/assets && go-bindata -pkg assets -o prod.go -tags assetsembedded ./ceb )
+  ( CGO_ENABLED=${CGO_ENABLED} go build -ldflags "${GOLDFLAGS}" -tags assetsembedded -o ./waypoint ./cmd/waypoint )
+)
+
+# create windows binaries
+# TODO: replaced / with _; might be confusing
+# ne: bin/windows
+bin_windows() (
+  GOOS=linux GOARCH=amd64 go build -o ./internal/assets/ceb/ceb ./cmd/waypoint-entrypoint
+  cd internal/assets && go-bindata -pkg assets -o prod.go -tags assetsembedded ./ceb
+  GOOS=windows GOARCH=amd64 CGO_ENABLED=${CGO_ENABLED} go build -ldflags "${GOLDFLAGS}" -tags assetsembedded -o ./waypoint.exe ./cmd/waypoint
+)
+
+# create the entrypoint for the current platform
+# ne: bin/entrypoint
+bin_entrypoint() (
+  # sic: yes, this recipe ignores the global CGO_ENABLED
+  CGO_ENABLED=0 go build -tags assetsembedded -o ./waypoint-entrypoint ./cmd/waypoint-entrypoint
+)
+
+# build and copy binaries to $GOPATH/bin/waypoint
+install() (
+  bin
+  cp ./waypoint ${GOPATH}/bin/waypoint
+)
+
+# run tests
+test() (
+  go test ./...
+)
+
+# format go code
+format() (
+  gofmt -s -w ./
+)
+
+# ne: docker/server
+docker_server() (
+  DOCKER_BUILDKIT=1 docker build \
+          --ssh default \
+          --secret id=ssh.config,src="${HOME}/.ssh/config" \
+          --secret id=ssh.key,src="${HOME}/.ssh/config" \
+          -t waypoint:dev \
+          .
+)
+
+# ne: docker/evanphx
+docker_evanphx() (
+  DOCKER_BUILDKIT=1 docker build -f hack/Dockerfile.evanphx \
+          --ssh default \
+          -t waypoint:latest \
+          .
+)
+
+# ne: gen/ts
+gen_ts() ( 
+  rm -rf ./ui/lib/api-common-protos/google 2> /dev/null
+  protoc -I=. \
+    -I=./vendor/proto/api-common-protos/ \
+    ./internal/server/proto/server.proto \
+    --js_out=import_style=commonjs:ui/lib/waypoint-pb/ \
+    --grpc-web_out=import_style=typescript,mode=grpcwebtext:ui/lib/waypoint-client/
+  mv ./ui/lib/waypoint-client/internal/server/proto/* ./ui/lib/waypoint-client/
+  mv ./ui/lib/waypoint-client/server_pb.d.ts ./ui/lib/waypoint-pb/
+  mv ./ui/lib/waypoint-pb/internal/server/proto/* ./ui/lib/waypoint-pb/
+  # Hack: fix import of api-common-protos and various JS/TS imports
+  # These issues below will help:
+  #   https://github.com/protocolbuffers/protobuf/issues/5119
+  #   https://github.com/protocolbuffers/protobuf/issues/6341
+  find . -type f -wholename './ui/lib/waypoint-pb/*' | xargs sed -i 's/..\/..\/..\/google\/rpc\/status/api-common-protos\/google\/rpc\/status/g'
+  find . -type f -wholename './ui/lib/waypoint-client/*' | xargs sed -i 's/..\/..\/..\/google\/rpc\/status/api-common-protos\/google\/rpc\/status/g'
+  find . -type f -wholename './ui/lib/waypoint-client/*' | xargs sed -i 's/.\/server_pb/waypoint-pb/g'
+  find . -type f -wholename './ui/lib/waypoint-client/*' | xargs sed -i 's/..\/..\/..\/internal\/server\/protwaypoint-pb/waypoint-pb/g'
+
+  protoc \
+    -I=./vendor/proto/api-common-protos/ \
+    ./vendor/proto/api-common-protos/google/**/*.proto \
+    --js_out=import_style=commonjs,binary:ui/lib/api-common-protos/ \
+    --ts_out=ui/lib/api-common-protos/
+  rm -rf ./ui/lib/waypoint-pb/internal
+  rm -rf ./ui/lib/waypoint-client/internal
+  rm -rf ./ui/vendor/vendor
+  rm -rf ./google
+)
+
+# ne: static-asssets
+static_assets() (
+  # This currently assumes you have run `ember build` in the ui/ directory
+  go-bindata -pkg gen -prefix dist -o ${ASSETFS_PATH} ./ui/dist/...
+  gofmt -s -w ${ASSETFS_PATH}
+)
+
+# ne: gen/doc
+gen_doc() (
+  rm -rf ./doc/* 2> /dev/null
+  protoc -I=. \
+    -I=./vendor/proto/api-common-protos/ \
+    --doc_out=./doc --doc_opt=html,index.html \
+    ./internal/server/proto/server.proto
+)
+
+# install dependencies and tools required to build
+tools() (
+  echo "Fetching tools..."
+  ${GO_CMD} generate -tags tools tools/tools.go
+  echo
+  echo "Done!"
+)
+
+# standard
+_shmake_main() {
+  for arg in "${@}"; do 
+    # TODO: split targets, vars, make flags...
+    eval "echo '=== $arg'; ($arg)"
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  _shmake_main "$@"
+fi
